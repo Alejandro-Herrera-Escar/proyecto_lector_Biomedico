@@ -1,22 +1,144 @@
-# ===============================================================
-#  PANEL BIOMÉDICO — ECG (gráfico) + SpO₂ + HR + CAÍDAS + EPILEPSIA
-#  Interfaz moderna estilo Dashboard (PyQt5 + MatPlotLib)
-# ===============================================================
+# monitor_biomedic.py
+# Versión con integración MySQL (mysql-connector-python)
+# Requisitos:
+# pip install mysql-connector-python
 
 import sys, time, threading, queue, csv
 from collections import deque
 from datetime import datetime
 
 import numpy as np
+from scipy.signal import butter, filtfilt
 import serial
 from PyQt5 import QtCore, QtWidgets
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
+# ---------------------------
+# CONFIGURACIÓN DB
+# ---------------------------
+DB_HOST = "localhost"
+DB_USER = "root"
+DB_PASS = ""            # cambia si tu XAMPP tiene contraseña
+DB_NAME = "kit_medico"
 
-# ------------------------------------------------------
-# CONFIGURACIÓN GENERAL
-# ------------------------------------------------------
+# Identificador del dispositivo/paciente asociado (cámbialo según tu tabla paciente)
+DEVICE_ID = 1
+
+try:
+    import mysql.connector
+    from mysql.connector import Error
+except Exception as e:
+    print("Aviso: no se pudo importar mysql.connector. Instala con: pip install mysql-connector-python")
+    mysql = None
+
+# ---------------------------
+# FUNCIONES DB
+# ---------------------------
+
+def db_connect():
+    """Crea una conexión nueva a la base de datos."""
+    return mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        autocommit=False
+    )
+
+
+def db_insert_medicion_blocking(dispositivo_id, sensor, tipo_lectura, valor, unidad):
+    """Inserta una medición y devuelve el id generado (bloqueante).
+    Usar solo para alertas u operaciones que necesiten el id inmediatamente.
+    """
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        sql = ("INSERT INTO medicion (dispositivo_id, sensor, tipo_lectura, valor, unidad, ts) "
+               "VALUES (%s,%s,%s,%s,%s,NOW())")
+        cur.execute(sql, (dispositivo_id, sensor, tipo_lectura, valor, unidad))
+        conn.commit()
+        inserted_id = cur.lastrowid
+        cur.close()
+        conn.close()
+        return inserted_id
+    except Exception as e:
+        print("Error insertando medicion (blocking):", e)
+        return None
+
+
+def db_insert_alerta_blocking(medicion_id, tipo_alerta, mensaje, nivel="critico"):
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        sql = ("INSERT INTO alerta (medicion_id, tipo_alerta, mensaje, nivel, atendida, ts) "
+               "VALUES (%s,%s,%s,%s,0,NOW())")
+        cur.execute(sql, (medicion_id, tipo_alerta, mensaje, nivel))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("Error insertando alerta:", e)
+
+
+class DbWriter(threading.Thread):
+    """Hilo que escribe mediciones asíncronamente desde una cola.
+    Evita bloquear la UI al insertar cada lectura.
+    """
+    def __init__(self, q):
+        super().__init__(daemon=True)
+        self.q = q
+        self._stop = threading.Event()
+        self.conn = None
+        self.cur = None
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                item = self.q.get(timeout=0.5)
+            except Exception:
+                continue
+
+            try:
+                # Conectar (si no lo está)
+                if self.conn is None or not self.conn.is_connected():
+                    try:
+                        self.conn = db_connect()
+                        self.cur = self.conn.cursor()
+                    except Exception as e:
+                        print("DBWriter: error conectando a DB:", e)
+                        time.sleep(1)
+                        continue
+
+                if item['type'] == 'medicion':
+                    sql = ("INSERT INTO medicion (dispositivo_id, sensor, tipo_lectura, valor, unidad, ts) "
+                           "VALUES (%s,%s,%s,%s,%s,NOW())")
+                    p = item['payload']
+                    try:
+                        self.cur.execute(sql, (p['dispositivo_id'], p['sensor'], p['tipo_lectura'], p['valor'], p['unidad']))
+                        self.conn.commit()
+                    except Exception as e:
+                        print("DBWriter: fallo insert medicion:", e)
+                        try:
+                            self.conn.rollback()
+                        except: pass
+
+                self.q.task_done()
+
+            except Exception as e:
+                print("DBWriter error procesando item:", e)
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self.cur: self.cur.close()
+            if self.conn: self.conn.close()
+        except: pass
+
+
+# ---------------------------
+# CONFIGURACIÓN GENERAL (tu código original)
+# ---------------------------
 
 DEFAULT_PORT = "COM7"
 BAUDRATE = 115200
@@ -29,7 +151,7 @@ ECG_SMOOTH_WINDOW = 5
 ECG_PEAK_STD_FACTOR = 1.0
 ECG_MIN_RR_MS = 350
 
-SPO2_WINDOW = 200
+SPO2_WINDOW = 300
 SPO2_MIN_VARIATION = 50
 
 ACC_SMOOTH_WINDOW = 4
@@ -40,9 +162,10 @@ SEIZURE_TREMOR_THRESHOLD = 250
 CSV_FLUSH_INTERVAL = 2.0
 
 
-# ------------------------------------------------------
-# FUNCIONES ÚTILES
-# ------------------------------------------------------
+# ---------------------------
+# FUNCIONES UTILES
+# ---------------------------
+
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
@@ -65,9 +188,33 @@ def highpass_subtract_mavg(signal, window):
     return arr - mavg
 
 
-# ------------------------------------------------------
+# --- FILTROS ADICIONALES PARA MEJORAR HR/SPO2
+def pan_tompkins_filter(ecg):
+    """Procesamiento tipo Pan-Tompkins: derivada + cuadrado + integración.
+    Devuelve la señal integrada, lista para detección de picos.
+    """
+    if len(ecg) < 3:
+        return ecg
+    der = np.diff(ecg, prepend=ecg[0])
+    sq = der ** 2
+    win = max(3, int(len(ecg) * 0.02))  # ventana proporcional (≈20 ms), adaptable
+    integ = np.convolve(sq, np.ones(win)/win, mode='same')
+    return integ
+
+
+def smooth_signal(sig, order=2, cutoff=0.08):
+    """Filtro Butterworth pasa-bajo para suavizar señales (normalizado 0..1)."""
+    try:
+        b, a = butter(order, cutoff)
+        return filtfilt(b, a, np.array(sig, dtype=float))
+    except Exception:
+        # en caso de que la ventana sea muy corta o falle, devolver original
+        return np.array(sig, dtype=float)
+
+
+# ---------------------------
 # SERIAL READER THREAD
-# ------------------------------------------------------
+# ---------------------------
 class SerialReader(threading.Thread):
     def __init__(self, port, baud, q, stop_event):
         super().__init__(daemon=True)
@@ -97,9 +244,9 @@ class SerialReader(threading.Thread):
         self.q.put(("__INFO__", "Serial detenido"))
 
 
-# ------------------------------------------------------
-# DETECTOR HR (PICOS DINÁMICOS)
-# ------------------------------------------------------
+# ---------------------------
+# HR DETECTOR
+# ---------------------------
 class HRDetector:
     def __init__(self):
         self.last_peak_t = None
@@ -139,16 +286,45 @@ class HRDetector:
         return bpm if 30 <= bpm <= 200 else None
 
 
-# ------------------------------------------------------
-# SPO2 CALCULATION (AC/DC)
-# ------------------------------------------------------
+# ---------------------------
+# SpO2 estimation
+# ---------------------------
 def estimate_spo2_from_ir_red(ir_vals, red_vals):
+    """Estimación de SpO2 usando AC/DC mejorada y suavizado.
+    - Filtra las señales IR/RED
+    - Usa desviación estándar para AC
+    - Ventana más larga para estabilidad
+    """
     try:
         ir = np.array(ir_vals, float)
         red = np.array(red_vals, float)
 
         if len(ir) < 40:
             return None
+
+        # Suavizar señales para reducir ruido de movimiento
+        ir_s = smooth_signal(ir)
+        red_s = smooth_signal(red)
+
+        # AC: usar desviación estándar en la ventana
+        ac_ir = float(np.std(ir_s))
+        ac_red = float(np.std(red_s))
+
+        # DC: valor medio
+        dc_ir = float(np.mean(ir_s))
+        dc_red = float(np.mean(red_s))
+
+        if ac_ir < SPO2_MIN_VARIATION or ac_red < SPO2_MIN_VARIATION:
+            return None
+
+        # Ratio R mejorado (con pequeño epsilon para evitar div/0)
+        r = (ac_red / (dc_red + 1e-9)) / (ac_ir / (dc_ir + 1e-9))
+        spo2 = 110 - 25 * r
+        spo2 = max(70, min(100, int(round(spo2))))
+        return spo2
+    except Exception as e:
+        #print('estimate_spo2 error', e)
+        return None
 
         ac_ir = np.max(ir) - np.min(ir)
         ac_red = np.max(red) - np.min(red)
@@ -166,9 +342,9 @@ def estimate_spo2_from_ir_red(ir_vals, red_vals):
         return None
 
 
-# =======================================================
-#  DASHBOARD PRINCIPAL
-# =======================================================
+# ---------------------------
+# DASHBOARD
+# ---------------------------
 class DashboardWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -179,6 +355,11 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.q = queue.Queue()
         self.stop_event = threading.Event()
         self.serial_thread = None
+
+        # Cola y writer DB
+        self.db_queue = queue.Queue()
+        self.db_writer = DbWriter(self.db_queue)
+        self.db_writer.start()
 
         self.ecg_buf = deque(maxlen=ECG_BUFFER)
         self.ecg_t = deque(maxlen=ECG_BUFFER)
@@ -217,9 +398,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.poll_serial)
         self.timer.start(30)
 
-    # ------------------------------------------------------
+    # ---------------------------
     # UI
-    # ------------------------------------------------------
+    # ---------------------------
     def _build_ui(self):
         w = QtWidgets.QWidget()
         self.setCentralWidget(w)
@@ -304,9 +485,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
         rp.addWidget(self.lbl_az)
         rp.addStretch()
 
-    # ------------------------------------------------------
+    # ---------------------------
     # Serial
-    # ------------------------------------------------------
+    # ---------------------------
     def toggle_conn(self):
         if self.serial_thread and self.serial_thread.is_alive():
             self.stop_event.set()
@@ -334,9 +515,9 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.csv_file.close()
             self.btn_csv.setText("Iniciar CSV")
 
-    # ------------------------------------------------------
+    # ---------------------------
     # Procesar serial
-    # ------------------------------------------------------
+    # ---------------------------
     def poll_serial(self):
         updated = False
         while not self.q.empty():
@@ -379,47 +560,81 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if ecg is not None:
             self.ecg_buf.append(ecg)
             self.ecg_t.append(t_ms)
+            # Inserción asíncrona (raw)
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'ECG', 'tipo_lectura':'raw', 'valor':ecg, 'unidad':'mV'
+            }})
 
         if ir is not None:
             self.ir_buf.append(ir)
             self.lbl_ir.setText(f"IR: {int(ir)}")
+            # opcional guardar lectura IR
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'IR', 'tipo_lectura':'raw', 'valor':ir, 'unidad':'adc'
+            }})
 
         if red is not None:
             self.red_buf.append(red)
             self.lbl_red.setText(f"RED: {int(red)}")
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'RED', 'tipo_lectura':'raw', 'valor':red, 'unidad':'adc'
+            }})
 
         if hr is not None:
             self.lbl_hr_sensorval.setText(f"HR(sensor): {int(hr)}")
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'HR', 'tipo_lectura':'sensor', 'valor':hr, 'unidad':'bpm'
+            }})
 
         if spo2 is not None:
             self.lbl_ir_sensorval.setText(f"SpO₂(sensor): {int(spo2)}%")
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'SPO2', 'tipo_lectura':'sensor', 'valor':spo2, 'unidad':'%'
+            }})
 
         if ax is not None:
             self.ax_buf.append(ax)
             self.acc_window_ax.append(ax)
             ax_s = sum(self.acc_window_ax) / len(self.acc_window_ax)
             self.lbl_ax.setText(f"AX: {ax_s:.1f}")
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'ACC', 'tipo_lectura':'AX', 'valor':ax_s, 'unidad':'g'
+            }})
 
         if ay is not None:
             self.ay_buf.append(ay)
             self.acc_window_ay.append(ay)
             ay_s = sum(self.acc_window_ay) / len(self.acc_window_ay)
             self.lbl_ay.setText(f"AY: {ay_s:.1f}")
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'ACC', 'tipo_lectura':'AY', 'valor':ay_s, 'unidad':'g'
+            }})
 
         if az is not None:
             self.az_buf.append(az)
             self.acc_window_az.append(az)
             az_s = sum(self.acc_window_az) / len(self.acc_window_az)
             self.lbl_az.setText(f"AZ: {az_s:.1f}")
+            self.db_queue.put({'type':'medicion','payload':{
+                'dispositivo_id': DEVICE_ID,
+                'sensor':'ACC', 'tipo_lectura':'AZ', 'valor':az_s, 'unidad':'g'
+            }})
 
         self.compute_ecg_hr()
         self.compute_spo2()
         self.detect_fall()
         self.detect_seizure()
 
-    # ------------------------------------------------------
-    # CÁLCULO HR ECG (SUAVIZADO CADA 5 s)
-    # ------------------------------------------------------
+    # ---------------------------
+    # CÁLCULO HR ECG
+    # ---------------------------
     def compute_ecg_hr(self):
         if len(self.ecg_buf) < 150:
             return
@@ -449,11 +664,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_bpm.setText(f"HR: {bpm} bpm")
                 self._last_hr_update = now_s
 
+                # Guardar medición HR (asíncrono)
+                self.db_queue.put({'type':'medicion','payload':{
+                    'dispositivo_id': DEVICE_ID,
+                    'sensor':'HR', 'tipo_lectura':'ecg', 'valor':bpm, 'unidad':'bpm'
+                }})
+
         self._last_ecg_plot = filt
 
-    # ------------------------------------------------------
-    # SpO₂ (SUAVIZADO CADA 5 s)
-    # ------------------------------------------------------
+    # ---------------------------
+    # SpO2
+    # ---------------------------
     def compute_spo2(self):
         if len(self.ir_buf) < SPO2_WINDOW or len(self.red_buf) < SPO2_WINDOW:
             return
@@ -470,9 +691,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 self.lbl_spo2.setText(f"SpO₂: {spo2} %")
                 self._last_spo2_update = now_s
 
-    # ------------------------------------------------------
+                self.db_queue.put({'type':'medicion','payload':{
+                    'dispositivo_id': DEVICE_ID,
+                    'sensor':'SPO2', 'tipo_lectura':'calc', 'valor':spo2, 'unidad':'%'
+                }})
+
+    # ---------------------------
     # DETECT FALL
-    # ------------------------------------------------------
+    # ---------------------------
     def detect_fall(self):
         if len(self.ax_buf) < 3:
             return
@@ -501,15 +727,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
                 if var < 300:
                     self.lbl_fall.setText("CAÍDA CONFIRMADA")
                     self.lbl_fall.setStyleSheet("color: red; font-weight:bold;")
+                    # insertar medición y alerta (aquí necesitamos el id de la medición)
+                    med_id = db_insert_medicion_blocking(DEVICE_ID, 'ACC', 'magnitude', magnitude, 'g')
+                    if med_id:
+                        db_insert_alerta_blocking(med_id, 'caida', 'Caída confirmada por inmovilidad', 'critico')
                 else:
                     self.lbl_fall.setText("Caída no confirmada")
                     self.lbl_fall.setStyleSheet("color: gray;")
 
                 self._fall_flag = False
 
-    # ------------------------------------------------------
+    # ---------------------------
     # DETECT EPILEPSIA
-    # ------------------------------------------------------
+    # ---------------------------
     def detect_seizure(self):
         if len(self.ax_buf) < 30:
             return
@@ -529,13 +759,17 @@ class DashboardWindow(QtWidgets.QMainWindow):
         if mov > SEIZURE_TREMOR_THRESHOLD and rms > 350:
             self.lbl_seizure.setText("¡CONVULSIÓN!")
             self.lbl_seizure.setStyleSheet("color: red; font-weight:bold;")
+            # insertar medición y alerta
+            med_id = db_insert_medicion_blocking(DEVICE_ID, 'ACC', 'rms', rms, 'g')
+            if med_id:
+                db_insert_alerta_blocking(med_id, 'convulsion', 'Patrón compatible con convulsión', 'critico')
         else:
             self.lbl_seizure.setText("Estable")
             self.lbl_seizure.setStyleSheet("color: lightgreen;")
 
-    # ------------------------------------------------------
+    # ---------------------------
     # PLOT ECG
-    # ------------------------------------------------------
+    # ---------------------------
     def update_ecg_plot(self):
         self.ax_ecg.cla()
 
@@ -559,9 +793,10 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.canvas.draw()
 
 
-# =======================================================
+# ---------------------------
 # MAIN
-# =======================================================
+# ---------------------------
+
 def main():
     app = QtWidgets.QApplication(sys.argv)
 
